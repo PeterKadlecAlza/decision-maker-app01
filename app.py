@@ -18,7 +18,7 @@ import pandas as pd
 import streamlit as st
 
 from processing import export_workbook, run_pipeline
-from storage import backup_database, initialize_storage, latest_batch_key, load_latest_pipeline_result, load_reviews, save_pipeline_result, save_review
+from storage import backup_database, database_path, initialize_storage, latest_batch_key, load_latest_pipeline_result, load_reviews, save_pipeline_result, save_review
 
 
 st.set_page_config(
@@ -106,7 +106,9 @@ def init_session_state() -> None:
     st.session_state.setdefault("current_batch_id", None)
     st.session_state.setdefault("current_input_signature", None)
     st.session_state.setdefault("current_result", None)
-    st.session_state.setdefault("admin_authenticated", False)
+    st.session_state.setdefault("access_role", None)
+    st.session_state.setdefault("access_identity", "")
+    st.session_state.setdefault("reviewer_link_authorized", False)
     st.session_state.setdefault("processed_export_ready_batch_id", None)
     st.session_state.setdefault("selected_case_id", None)
     st.session_state.setdefault("review_widget_case_id", None)
@@ -116,26 +118,64 @@ def init_session_state() -> None:
     st.session_state.setdefault("session_saved_case_ids", set())
 
 
-def render_admin_login() -> bool:
-    configured_password = os.environ.get("INSTRUCTION_VALIDATOR_ADMIN_PASSWORD", "")
-    st.sidebar.markdown("### Admin")
-    if not configured_password:
-        st.sidebar.warning("Admin upload nie je nakonfigurovaný.")
-        return False
-    if st.session_state.get("admin_authenticated"):
-        st.sidebar.success("Admin prístup aktívny.")
-        if st.sidebar.button("Odhlásiť admina"):
-            st.session_state.admin_authenticated = False
+def render_access_login() -> str | None:
+    admin_password = os.environ.get("INSTRUCTION_VALIDATOR_ADMIN_PASSWORD", "")
+    reviewer_token = os.environ.get("INSTRUCTION_VALIDATOR_REVIEWER_TOKEN", "")
+    st.sidebar.markdown("### Prihlásenie")
+    role = st.session_state.get("access_role")
+    if role in {"admin", "reviewer"}:
+        identity = st.session_state.get("access_identity") or "neznámy používateľ"
+        role_label = "Admin" if role == "admin" else "Kvalitár"
+        st.sidebar.success(f"{role_label}: {identity}")
+        if st.sidebar.button("Odhlásiť"):
+            st.session_state.access_role = None
+            st.session_state.access_identity = ""
+            st.session_state.reviewer_link_authorized = False
             st.rerun()
-        return True
-    password = st.sidebar.text_input("Admin heslo", type="password")
+        return role
+
+    supplied_token = str(st.query_params.get("reviewer_token", "") or "")
+    if supplied_token:
+        if reviewer_token and hmac.compare_digest(supplied_token, reviewer_token):
+            st.session_state.reviewer_link_authorized = True
+            st.query_params.clear()
+        else:
+            st.query_params.clear()
+            st.sidebar.error("Prístupový link nie je platný.")
+
+    if st.session_state.get("reviewer_link_authorized"):
+        st.sidebar.success("Prístup kvalitára bol overený.")
+        identity = st.sidebar.text_input("Meno kvalitára", key="reviewer_identity")
+        if st.sidebar.button("Pokračovať ako kvalitár"):
+            clean_identity = str(identity or "").strip()
+            if not clean_identity:
+                st.sidebar.error("Zadajte svoje meno.")
+                return None
+            st.session_state.access_role = "reviewer"
+            st.session_state.access_identity = clean_identity
+            st.rerun()
+        return None
+
+    if not admin_password:
+        st.sidebar.warning("Admin prístup nie je nakonfigurovaný.")
+        return None
+    st.sidebar.caption("Admin prístup")
+    identity = st.sidebar.text_input("Meno admina", key="login_identity")
+    password = st.sidebar.text_input("Admin heslo", type="password", key="login_password")
     if st.sidebar.button("Prihlásiť admina"):
-        if hmac.compare_digest(password, configured_password):
-            st.session_state.admin_authenticated = True
+        clean_identity = str(identity or "").strip()
+        if not clean_identity:
+            st.sidebar.error("Zadajte meno admina.")
+            return None
+        if hmac.compare_digest(password, admin_password):
+            st.session_state.access_role = "admin"
+            st.session_state.access_identity = clean_identity
             st.rerun()
         else:
             st.sidebar.error("Nesprávne admin heslo.")
-    return False
+    if not reviewer_token:
+        st.sidebar.caption("Prístupový link kvalitára zatiaľ nie je nakonfigurovaný.")
+    return None
 
 
 NEW_REVIEW_STATUS_OPTIONS = [
@@ -329,7 +369,7 @@ def _current_timestamp() -> str:
 
 
 def _current_user_identifier() -> str:
-    for key in ["current_user", "username", "user", "user_email", "email", "name"]:
+    for key in ["access_identity", "current_user", "username", "user", "user_email", "email", "name"]:
         value = st.session_state.get(key)
         if value:
             return str(value)
@@ -1682,16 +1722,96 @@ def render_upload_processing(result) -> None:
         st.success("Processing complete. Open the Dashboard and Decision Review tabs.")
 
 
+def render_data_exports(result, role: str) -> None:
+    st.subheader("Dáta a exporty")
+    reviewed_cases = build_reviewed_cases(result)
+    current_user = _current_user_identifier()
+
+    if role == "admin":
+        saved_mask = (
+            reviewed_cases["review_saved_at"].astype(str).ne("")
+            | reviewed_cases["change_executed_at"].astype(str).ne("")
+            | reviewed_cases["validator_note"].astype(str).ne("")
+        )
+        executed_mask = reviewed_cases["change_execution_status"].astype(str).eq("Zmena vykonaná")
+        metric_cols = st.columns(3)
+        metric_cols[0].metric("Všetky prípady", len(reviewed_cases))
+        metric_cols[1].metric("Uložené rozhodnutia", int(saved_mask.sum()))
+        metric_cols[2].metric("Vykonané zmeny", int(executed_mask.sum()))
+        st.download_button(
+            "Stiahnuť všetky rozhodnutia (Excel)",
+            data=reviewed_cases_bytes(reviewed_cases),
+            file_name="all_decisions.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        reviewer_token = os.environ.get("INSTRUCTION_VALIDATOR_REVIEWER_TOKEN", "")
+        if reviewer_token:
+            reviewer_url = f"{st.context.url}?reviewer_token={quote_plus(reviewer_token)}"
+            st.text_input(
+                "Prístupový link pre kvalitára",
+                value=reviewer_url,
+                disabled=True,
+                help="Každý, kto pozná tento link, sa môže prihlásiť ako kvalitár.",
+            )
+        else:
+            st.warning("Prístupový link kvalitára nie je nakonfigurovaný v Streamlit Secrets.")
+        if st.button("Pripraviť databázovú zálohu"):
+            backup_path = backup_database()
+            if backup_path is not None:
+                st.session_state["admin_database_backup"] = {
+                    "name": backup_path.name,
+                    "data": backup_path.read_bytes(),
+                }
+        prepared_backup = st.session_state.get("admin_database_backup")
+        if prepared_backup:
+            st.download_button(
+                "Stiahnuť databázovú zálohu",
+                data=prepared_backup["data"],
+                file_name=prepared_backup["name"],
+                mime="application/vnd.sqlite3",
+            )
+        st.caption(f"Aktívna databáza: {database_path().name}")
+        st.dataframe(reviewed_cases, use_container_width=True, hide_index=True)
+        return
+
+    completed_mask = (
+        reviewed_cases["change_execution_status"].astype(str).eq("Zmena vykonaná")
+        | reviewed_cases["review_status"].astype(str).eq("Zmena vykonaná")
+        | reviewed_cases["status"].astype(str).eq("Zmena vykonaná")
+    )
+    user_mask = (
+        reviewed_cases["review_saved_by"].astype(str).eq(current_user)
+        | reviewed_cases["change_executed_by"].astype(str).eq(current_user)
+    )
+    reviewer_cases = reviewed_cases.loc[completed_mask & user_mask].copy()
+    st.caption(f"Rozhodnutia používateľa {current_user}: {len(reviewer_cases)}")
+    if reviewer_cases.empty:
+        st.info("Zatiaľ nemáte žiadne dokončené rozhodnutia.")
+        return
+    st.download_button(
+        "Stiahnuť moje dokončené rozhodnutia",
+        data=reviewed_cases_bytes(reviewer_cases),
+        file_name="my_completed_decisions.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+    st.dataframe(reviewer_cases, use_container_width=True, hide_index=True)
+
+
 def main() -> None:
     init_session_state()
-    is_admin = render_admin_login()
+    role = render_access_login()
     st.title("Packaging Instruction Enrichment & Decision Maker")
     st.caption("Turn packaging-instruction reviews into a clearer decision workflow for non-technical users.")
 
+    if role is None:
+        st.info("Aplikácia obsahuje firemné dáta. Pre pokračovanie sa prihláste.")
+        st.stop()
+        return
+
     reports_raw, products_raw, result = get_uploaded_result()
 
-    section_labels = ["Dashboard", "Decision Review", "Customer online review", "Download"]
-    if is_admin:
+    section_labels = ["Dashboard", "Decision Review", "Customer online review", "Dáta a exporty"]
+    if role == "admin":
         section_labels.insert(0, "Admin upload")
     selected_section = st.radio("Section", section_labels, horizontal=True, label_visibility="collapsed")
 
@@ -1712,71 +1832,11 @@ def main() -> None:
             st.info("Upload both required files to look up online reviews.")
         else:
             render_customer_online_review(result)
-    elif selected_section == "Download":
+    elif selected_section == "Dáta a exporty":
         if result is None:
             st.info("Upload both required files to enable downloads.")
         else:
-            st.subheader("Processed workbook")
-            workbook_cache = st.session_state.setdefault("processed_workbook_cache", {})
-            batch_id = st.session_state.get("current_batch_id")
-            if st.session_state.get("processed_export_ready_batch_id") != batch_id:
-                st.info("Export sa pripraví až po kliknutí, aby otvorenie sekcie zostalo rýchle.")
-                if st.button("Prepare processed workbook"):
-                    st.session_state.processed_export_ready_batch_id = batch_id
-                    st.rerun()
-            else:
-                if batch_id not in workbook_cache:
-                    with st.spinner("Pripravujem Excel export..."):
-                        workbook_cache[batch_id] = export_workbook(result)
-                st.download_button(
-                    "Download processed Excel workbook",
-                    data=workbook_cache[batch_id],
-                    file_name="Chybne_instrukce_processed.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-
-            if st.checkbox("Generate reviewed cases export", value=False):
-                reviewed_cases = build_reviewed_cases(result)
-                completed_mask = (
-                    reviewed_cases["change_execution_status"].astype(str) == "Zmena vykonaná"
-                ) | (
-                    reviewed_cases["review_status"].astype(str) == "Zmena vykonaná"
-                ) | (
-                    reviewed_cases["status"].astype(str) == "Zmena vykonaná"
-                )
-                completed_cases = reviewed_cases.loc[completed_mask].copy()
-                session_case_ids = {
-                    str(case_id)
-                    for case_id in st.session_state.get("session_saved_case_ids", set())
-                }
-                current_user = _current_user_identifier()
-                user_mask = (
-                    completed_cases["review_saved_by"].astype(str).eq(current_user)
-                    | completed_cases["change_executed_by"].astype(str).eq(current_user)
-                )
-                completed_cases = completed_cases.loc[
-                    completed_cases["case_id"].astype(str).isin(session_case_ids) & user_mask
-                ].copy()
-                completed_cases.loc[
-                    completed_cases["change_execution_status"].astype(str) != "Zmena vykonaná",
-                    "change_execution_status",
-                ] = "Zmena vykonaná"
-                if not completed_cases.empty:
-                    st.subheader("Cases with executed change")
-                    st.caption(
-                        f"Export obsahuje {len(completed_cases)} case(s) uložených používateľom "
-                        f"{current_user} v tejto relácii."
-                    )
-                    reviewed_bytes = reviewed_cases_bytes(completed_cases)
-                    st.download_button(
-                        "Download completed cases",
-                        data=reviewed_bytes,
-                        file_name="completed_cases.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    )
-                    st.dataframe(completed_cases, use_container_width=True, hide_index=True)
-                else:
-                    st.info("Zatiaľ nebola vykonaná žiadna zmena.")
+            render_data_exports(result, role)
 
 
 if __name__ == "__main__":

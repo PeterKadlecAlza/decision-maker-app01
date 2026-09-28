@@ -37,7 +37,7 @@ When the app is opened without a new upload, it loads the latest saved batch. Re
 
 ## Admin access and backups
 
-The upload screen is visible only after admin login. Configure the admin password outside Git with `INSTRUCTION_VALIDATOR_ADMIN_PASSWORD`.
+The entire app is visible only after login. Configure the admin password with `INSTRUCTION_VALIDATOR_ADMIN_PASSWORD` and a long random reviewer-link token with `INSTRUCTION_VALIDATOR_REVIEWER_TOKEN`. Admins can upload data, copy the reviewer access link, and export all decisions or a database backup. Reviewers enter through the access link, identify themselves by name, review cases, and export their own completed decisions.
 The app creates a SQLite backup after a new batch upload, an explicit review save, and confirmation that a change was executed. Backups are stored in `.data/backups/` and the newest 20 files are retained.
 To use another backup directory, set `INSTRUCTION_VALIDATOR_BACKUP_DIR`.
 
