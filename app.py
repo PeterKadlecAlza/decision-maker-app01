@@ -18,7 +18,7 @@ import pandas as pd
 import streamlit as st
 
 from processing import export_workbook, run_pipeline
-from storage import backup_database, database_path, initialize_storage, latest_batch_key, load_latest_pipeline_result, load_reviews, save_pipeline_result, save_review
+from storage import backup_database, initialize_storage, latest_batch_key, load_latest_pipeline_result, load_reviews, save_pipeline_result, save_review, storage_location_label, uses_persistent_cloud_storage
 
 
 st.set_page_config(
@@ -1073,7 +1073,8 @@ def get_uploaded_result() -> tuple[pd.DataFrame, pd.DataFrame, object | None]:
         "min_report_count": int(st.session_state.get("min_report_count_input", 0)),
     }
     batch_id = save_pipeline_result(result, signature, config)
-    backup_database()
+    if not uses_persistent_cloud_storage():
+        backup_database()
     st.session_state.current_batch_id = batch_id
     st.session_state.current_input_signature = signature
     st.session_state.current_result = result
@@ -1457,7 +1458,8 @@ def save_current_review(case_id: str, case_row: pd.Series, explicit_save: bool =
     save_review(st.session_state.get("current_batch_id"), case_id, review_entry)
     if explicit_save:
         _mark_case_saved_for_session(case_id)
-        backup_database()
+        if not uses_persistent_cloud_storage():
+            backup_database()
 
 
 def mark_change_as_executed(case_id: str) -> None:
@@ -1469,7 +1471,8 @@ def mark_change_as_executed(case_id: str) -> None:
     st.session_state[_review_widget_key(case_id, "status")] = updated["review_status"]
     save_review(st.session_state.get("current_batch_id"), case_id, updated)
     _mark_case_saved_for_session(case_id)
-    backup_database()
+    if not uses_persistent_cloud_storage():
+        backup_database()
 
 
 def build_reviewed_cases(result) -> pd.DataFrame:
@@ -1685,35 +1688,39 @@ def render_decision_review(result) -> None:
 
 
 def render_upload_processing(result) -> None:
-    st.subheader("Upload & Processing")
-    upload_cols = st.columns(3)
-    with upload_cols[0]:
-        st.file_uploader("Chybné instrukcie Excel", type=["xlsx"], key="reports_file_upload")
-    with upload_cols[1]:
-        st.file_uploader("Produkty a vlastnosti Excel", type=["xlsx"], key="products_file_upload")
-    with upload_cols[2]:
-        st.file_uploader(
-            "Baliace pravidlá Excel (optional)",
-            type=["xlsx"],
-            key="packing_rules_file_upload",
-            help="Optional in this MVP. The pipeline does not depend on it.",
-        )
+    st.subheader("Zdrojové dáta")
+    if result is not None:
+        st.success("Používa sa posledná uložená dátová dávka. Excel súbory netreba nahrávať znova.")
+    st.caption(f"Úložisko: {storage_location_label()}")
 
-    settings_cols = st.columns(3)
-    with settings_cols[0]:
-        st.number_input("TOP N", min_value=1, value=100, step=1, key="top_n_input")
-    with settings_cols[1]:
-        st.checkbox("Exclude Štítok", value=True, key="exclude_stitok_input")
-    with settings_cols[2]:
-        st.number_input("Minimum report_count", min_value=0, value=0, step=1, key="min_report_count_input")
+    upload_title = "Nahrať novú dátovú dávku" if result is not None else "Nahrať prvú dátovú dávku"
+    with st.expander(upload_title, expanded=result is None):
+        upload_cols = st.columns(3)
+        with upload_cols[0]:
+            st.file_uploader("Chybné instrukcie Excel", type=["xlsx"], key="reports_file_upload")
+        with upload_cols[1]:
+            st.file_uploader("Produkty a vlastnosti Excel", type=["xlsx"], key="products_file_upload")
+        with upload_cols[2]:
+            st.file_uploader(
+                "Baliace pravidlá Excel (optional)",
+                type=["xlsx"],
+                key="packing_rules_file_upload",
+                help="Optional in this MVP. The pipeline does not depend on it.",
+            )
+
+        settings_cols = st.columns(3)
+        with settings_cols[0]:
+            st.number_input("TOP N", min_value=1, value=100, step=1, key="top_n_input")
+        with settings_cols[1]:
+            st.checkbox("Exclude Štítok", value=True, key="exclude_stitok_input")
+        with settings_cols[2]:
+            st.number_input("Minimum report_count", min_value=0, value=0, step=1, key="min_report_count_input")
 
     reports_file = st.session_state.get("reports_file_upload")
     products_file = st.session_state.get("products_file_upload")
     if reports_file is None or products_file is None:
         if result is None:
             st.info("Upload Chybné instrukcie and Produkty a vlastnosti to run the pipeline.")
-        else:
-            st.success("Načítaná posledná uložená dávka. Nový upload ju môže nahradiť.")
     elif result is not None:
         if result.warnings:
             st.subheader("Warnings")
@@ -1747,12 +1754,10 @@ def render_data_exports(result, role: str) -> None:
         reviewer_token = os.environ.get("INSTRUCTION_VALIDATOR_REVIEWER_TOKEN", "")
         if reviewer_token:
             reviewer_url = f"{st.context.url}?reviewer_token={quote_plus(reviewer_token)}"
-            st.text_input(
-                "Prístupový link pre kvalitára",
-                value=reviewer_url,
-                disabled=True,
-                help="Každý, kto pozná tento link, sa môže prihlásiť ako kvalitár.",
-            )
+            st.markdown("**Prístupový link pre kvalitára**")
+            st.code(reviewer_url, language=None, wrap_lines=True)
+            st.link_button("Otvoriť testovací link", reviewer_url)
+            st.caption("Každý, kto pozná tento link, sa môže prihlásiť ako kvalitár.")
         else:
             st.warning("Prístupový link kvalitára nie je nakonfigurovaný v Streamlit Secrets.")
         if st.button("Pripraviť databázovú zálohu"):
@@ -1768,9 +1773,9 @@ def render_data_exports(result, role: str) -> None:
                 "Stiahnuť databázovú zálohu",
                 data=prepared_backup["data"],
                 file_name=prepared_backup["name"],
-                mime="application/vnd.sqlite3",
+                mime="application/json" if prepared_backup["name"].endswith(".json") else "application/vnd.sqlite3",
             )
-        st.caption(f"Aktívna databáza: {database_path().name}")
+        st.caption(f"Aktívne úložisko: {storage_location_label()}")
         st.dataframe(reviewed_cases, use_container_width=True, hide_index=True)
         return
 
