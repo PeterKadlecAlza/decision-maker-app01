@@ -297,6 +297,9 @@ def build_console_action_guidance(case_row: pd.Series, review_state: dict | None
         case_row,
         "Popis produktu",
         "Produktový popis",
+        "Ext. jméno",
+        "Externí jméno",
+        "External name",
         "Description",
         "Long description",
         default="",
@@ -548,6 +551,16 @@ def render_product_header(case_row: pd.Series) -> None:
         sku = _row_safe_value(case_row, "Kód produktu")
         product_id = _row_safe_value(case_row, "Product ID", "SEOPrefix_ID", "ID produktu")
         category = _row_safe_value(case_row, "Segment1", "Kategória", "Kategorie")
+        product_description = _row_safe_value(
+            case_row,
+            "Popis produktu",
+            "Produktový popis",
+            "Ext. jméno",
+            "Externí jméno",
+            "External name",
+            "Description",
+            "Long description",
+        )
         current_instruction = _row_safe_value(
             case_row,
             "Přeložené instrukce",
@@ -561,6 +574,7 @@ def render_product_header(case_row: pd.Series) -> None:
                     "SKU": sku,
                     "Product ID": product_id,
                     "Kategória produktu": category,
+                    "Popis produktu": product_description,
                     "Aktuálna baliaca inštrukcia": current_instruction,
                 }
             ]
