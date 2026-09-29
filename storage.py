@@ -206,6 +206,40 @@ def save_pipeline_result(result, input_signature: str, config: dict) -> int:
     return batch_id
 
 
+def update_batch_tables(batch_id: int, result, table_names: tuple[str, ...] | list[str]) -> None:
+    """Replace selected tables in an existing batch without changing its reviews."""
+    selected_names = tuple(dict.fromkeys(table_names))
+    unknown_names = set(selected_names) - set(TABLE_NAMES)
+    if unknown_names:
+        raise ValueError(f"Neznáme tabuľky dávky: {', '.join(sorted(unknown_names))}")
+    initialize_storage()
+    if uses_persistent_cloud_storage():
+        for table_name in selected_names:
+            _supabase_request(
+                "POST",
+                "batch_tables",
+                query={"on_conflict": "batch_id,table_name"},
+                payload={
+                    "batch_id": int(batch_id),
+                    "table_name": table_name,
+                    "payload_json": _frame_to_json(getattr(result, table_name)),
+                },
+                prefer="resolution=merge-duplicates,return=minimal",
+            )
+        return
+    with _connect() as connection:
+        for table_name in selected_names:
+            connection.execute(
+                """
+                INSERT INTO batch_tables (batch_id, table_name, payload_json)
+                VALUES (?, ?, ?)
+                ON CONFLICT(batch_id, table_name) DO UPDATE SET
+                    payload_json = excluded.payload_json
+                """,
+                (int(batch_id), table_name, _frame_to_json(getattr(result, table_name))),
+            )
+
+
 def _result_from_rows(batch_row, table_rows):
     from processing import PipelineResult
 

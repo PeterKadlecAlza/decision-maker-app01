@@ -17,8 +17,8 @@ from typing import Iterable
 import pandas as pd
 import streamlit as st
 
-from processing import export_workbook, run_pipeline
-from storage import backup_database, initialize_storage, latest_batch_key, load_latest_pipeline_result, load_reviews, save_pipeline_result, save_review, storage_location_label, uses_persistent_cloud_storage
+from processing import clean_code_value, export_workbook, run_pipeline
+from storage import backup_database, initialize_storage, latest_batch_key, load_latest_pipeline_result, load_reviews, save_pipeline_result, save_review, storage_location_label, update_batch_tables, uses_persistent_cloud_storage
 
 
 st.set_page_config(
@@ -77,6 +77,62 @@ def read_excel_upload(uploaded_file) -> pd.DataFrame:
     if uploaded_file is None:
         return pd.DataFrame()
     return pd.read_excel(uploaded_file, dtype=object, engine="openpyxl")
+
+
+PRODUCT_DESCRIPTION_COLUMNS = [
+    "Popis produktu",
+    "Produktový popis",
+    "Ext. jméno",
+    "Externí jméno",
+    "External name",
+    "Description",
+    "Long description",
+]
+
+
+def enrich_current_batch_with_descriptions(result, descriptions_raw: pd.DataFrame) -> dict[str, int]:
+    """Merge descriptions into the current batch while preserving cases and reviews."""
+    code_column = _resolve_column(descriptions_raw, "Kód produktu", "SKU")
+    description_column = _resolve_column(descriptions_raw, *PRODUCT_DESCRIPTION_COLUMNS)
+    if code_column is None:
+        raise ValueError("V Exceli chýba stĺpec Kód produktu.")
+    if description_column is None:
+        raise ValueError("V Exceli chýba stĺpec Ext. jméno alebo Popis produktu.")
+
+    source = descriptions_raw.loc[:, [code_column, description_column]].copy()
+    source["_code"] = source[code_column].map(clean_code_value)
+    source["_description"] = source[description_column].map(
+        lambda value: None if pd.isna(value) else str(value).strip()
+    )
+    source = source.dropna(subset=["_code", "_description"])
+    source = source[source["_description"].ne("")]
+    source = source.drop_duplicates(subset=["_code"], keep="last")
+    description_map = dict(zip(source["_code"].astype(str), source["_description"]))
+    if not description_map:
+        raise ValueError("Excel neobsahuje žiadne použiteľné kódy a popisy produktov.")
+
+    matched_product_codes: set[str] = set()
+    matched_cases = 0
+    for table_name in ("products_clean", "cases_enriched", "ai_cases_input"):
+        frame = getattr(result, table_name).copy()
+        target_code_column = _resolve_column(frame, "Kód produktu", "SKU")
+        if target_code_column is None:
+            continue
+        normalized_codes = frame[target_code_column].map(clean_code_value).astype("string")
+        matched_mask = normalized_codes.isin(description_map)
+        frame.loc[matched_mask, "Popis produktu"] = normalized_codes[matched_mask].map(description_map)
+        setattr(result, table_name, frame)
+        if table_name == "products_clean":
+            matched_product_codes.update(normalized_codes[matched_mask].dropna().astype(str))
+        elif table_name == "cases_enriched":
+            matched_cases = int(matched_mask.sum())
+
+    return {
+        "input_descriptions": len(description_map),
+        "matched_products": len(matched_product_codes),
+        "matched_cases": matched_cases,
+        "unmatched_products": len(set(description_map) - matched_product_codes),
+    }
 
 
 def _input_signature(reports_file, products_file) -> str:
@@ -1782,6 +1838,44 @@ def render_upload_processing(result) -> None:
             st.checkbox("Exclude Štítok", value=True, key="exclude_stitok_input")
         with settings_cols[2]:
             st.number_input("Minimum report_count", min_value=0, value=0, step=1, key="min_report_count_input")
+
+    if result is not None:
+        with st.expander("Doplniť iba popisy produktov", expanded=False):
+            st.caption(
+                "Excel musí obsahovať Kód produktu a Ext. jméno alebo Popis produktu. "
+                "Hlásenia, cases a uložené rozhodnutia sa nemenia."
+            )
+            descriptions_file = st.file_uploader(
+                "Excel s popismi produktov",
+                type=["xlsx"],
+                key="product_descriptions_upload",
+            )
+            if st.button("Pridať popisy do aktuálnej dávky", type="primary"):
+                if descriptions_file is None:
+                    st.warning("Najprv vyberte Excel s popismi produktov.")
+                else:
+                    try:
+                        descriptions_raw = read_excel_upload(descriptions_file)
+                        import_stats = enrich_current_batch_with_descriptions(result, descriptions_raw)
+                        batch_id = st.session_state.get("current_batch_id")
+                        if batch_id is None:
+                            raise ValueError("Aktuálna dátová dávka nemá batch_id.")
+                        update_batch_tables(
+                            batch_id,
+                            result,
+                            ["products_clean", "cases_enriched", "ai_cases_input"],
+                        )
+                        st.session_state.current_result = result
+                        load_latest_pipeline_result_cached.clear()
+                        if not uses_persistent_cloud_storage():
+                            backup_database()
+                        st.success(
+                            f"Popisy boli doplnené pre {import_stats['matched_products']} produktov "
+                            f"a {import_stats['matched_cases']} cases. "
+                            f"Bez zhody: {import_stats['unmatched_products']}."
+                        )
+                    except Exception as exc:
+                        st.error(f"Popisy sa nepodarilo doplniť: {exc}")
 
     reports_file = st.session_state.get("reports_file_upload")
     products_file = st.session_state.get("products_file_upload")
