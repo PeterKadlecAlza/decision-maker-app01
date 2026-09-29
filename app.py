@@ -110,6 +110,9 @@ def init_session_state() -> None:
     st.session_state.setdefault("access_identity", "")
     st.session_state.setdefault("reviewer_link_authorized", False)
     st.session_state.setdefault("processed_export_ready_batch_id", None)
+    st.session_state.setdefault("review_list_page_size", 20)
+    st.session_state.setdefault("review_visible_case_count", 20)
+    st.session_state.setdefault("review_case_filter_signature", None)
     st.session_state.setdefault("selected_case_id", None)
     st.session_state.setdefault("review_widget_case_id", None)
     st.session_state.setdefault("review_status_widget", REVIEW_STATUS_OPTIONS[0])
@@ -1670,10 +1673,54 @@ def render_decision_review(result) -> None:
         filtered = filtered[filtered["case_id"].astype(str).isin(saved_case_ids)]
         list_title = "Cases solved"
 
-    display_columns = [column for column in DISPLAY_CASE_COLUMNS if column in filtered.columns]
-    visible_cases = filtered.head(50)
     st.subheader(list_title)
-    st.caption(f"Zobrazených prvých {len(visible_cases)} z {len(filtered)} filtrovaných cases.")
+
+    count_columns = st.columns([1, 1, 1, 3])
+    with count_columns[0]:
+        page_size = st.selectbox(
+            "Načítať naraz",
+            options=[10, 20, 50, 100],
+            key="review_list_page_size",
+        )
+
+    filtered_case_ids = (
+        filtered["case_id"].dropna().astype(str).tolist() if "case_id" in filtered.columns else []
+    )
+    filter_signature = hashlib.sha256(
+        f"{case_view}|{page_size}|".encode("utf-8")
+        + "\0".join(filtered_case_ids).encode("utf-8")
+    ).hexdigest()
+    if st.session_state.review_case_filter_signature != filter_signature:
+        st.session_state.review_case_filter_signature = filter_signature
+        st.session_state.review_visible_case_count = page_size
+
+    visible_count = min(int(st.session_state.review_visible_case_count), len(filtered))
+    remaining_count = max(len(filtered) - visible_count, 0)
+    with count_columns[1]:
+        if st.button(
+            f"Načítať ďalších {page_size}",
+            disabled=remaining_count == 0,
+            use_container_width=True,
+        ):
+            visible_count = min(visible_count + page_size, len(filtered))
+            st.session_state.review_visible_case_count = visible_count
+            remaining_count = max(len(filtered) - visible_count, 0)
+    with count_columns[2]:
+        if st.button(
+            "Zobraziť všetky",
+            disabled=remaining_count == 0,
+            use_container_width=True,
+        ):
+            visible_count = len(filtered)
+            st.session_state.review_visible_case_count = visible_count
+            remaining_count = 0
+
+    display_columns = [column for column in DISPLAY_CASE_COLUMNS if column in filtered.columns]
+    visible_cases = filtered.head(visible_count)
+    st.caption(
+        f"Zobrazených {len(visible_cases)} z {len(filtered)} filtrovaných cases. "
+        f"Zostáva {remaining_count}."
+    )
     st.dataframe(visible_cases.loc[:, display_columns], use_container_width=True, hide_index=True)
 
     case_options = visible_cases["case_id"].dropna().astype(str).tolist() if "case_id" in visible_cases.columns else []
@@ -1681,7 +1728,13 @@ def render_decision_review(result) -> None:
         st.info("No cases match the current filters.")
         return
 
-    selected_case_id = st.selectbox("Select case_id", options=case_options, index=0)
+    if st.session_state.get("decision_case_selector") not in case_options:
+        st.session_state["decision_case_selector"] = case_options[0]
+    selected_case_id = st.selectbox(
+        "Select case_id",
+        options=case_options,
+        key="decision_case_selector",
+    )
     selected_row = review_df.loc[review_df["case_id"].astype(str) == selected_case_id].iloc[0]
     ensure_review_defaults(selected_case_id, selected_row)
     render_case_detail(selected_case_id, selected_row)
