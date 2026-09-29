@@ -89,15 +89,40 @@ PRODUCT_DESCRIPTION_COLUMNS = [
     "Long description",
 ]
 
+PRODUCT_CODE_COLUMNS = [
+    "Kód produktu",
+    "SKU",
+    "Kód",
+    "Product code",
+    "ProductCode",
+    "Item code",
+    "ItemCode",
+    "Kód zboží",
+    "Alza kód",
+    "Code",
+    "Part number",
+]
 
-def enrich_current_batch_with_descriptions(result, descriptions_raw: pd.DataFrame) -> dict[str, int]:
+
+def enrich_current_batch_with_descriptions(
+    result,
+    descriptions_raw: pd.DataFrame,
+    code_column=None,
+    description_column=None,
+) -> dict[str, int]:
     """Merge descriptions into the current batch while preserving cases and reviews."""
-    code_column = _resolve_column(descriptions_raw, "Kód produktu", "SKU")
-    description_column = _resolve_column(descriptions_raw, *PRODUCT_DESCRIPTION_COLUMNS)
     if code_column is None:
-        raise ValueError("V Exceli chýba stĺpec Kód produktu.")
+        code_column = _resolve_column(descriptions_raw, *PRODUCT_CODE_COLUMNS)
     if description_column is None:
-        raise ValueError("V Exceli chýba stĺpec Ext. jméno alebo Popis produktu.")
+        description_column = _resolve_column(descriptions_raw, *PRODUCT_DESCRIPTION_COLUMNS)
+    if code_column is None:
+        raise ValueError("Vyberte stĺpec, ktorý obsahuje kód produktu.")
+    if description_column is None:
+        raise ValueError("Vyberte stĺpec, ktorý obsahuje popis produktu.")
+    if code_column not in descriptions_raw.columns or description_column not in descriptions_raw.columns:
+        raise ValueError("Vybrané stĺpce sa v Exceli nenašli.")
+    if code_column == description_column:
+        raise ValueError("Kód produktu a popis musia byť dva rozdielne stĺpce.")
 
     source = descriptions_raw.loc[:, [code_column, description_column]].copy()
     source["_code"] = source[code_column].map(clean_code_value)
@@ -1842,7 +1867,7 @@ def render_upload_processing(result) -> None:
     if result is not None:
         with st.expander("Doplniť iba popisy produktov", expanded=False):
             st.caption(
-                "Excel musí obsahovať Kód produktu a Ext. jméno alebo Popis produktu. "
+                "Vyberte stĺpec s kódom a stĺpec s popisom. "
                 "Hlásenia, cases a uložené rozhodnutia sa nemenia."
             )
             descriptions_file = st.file_uploader(
@@ -1850,13 +1875,52 @@ def render_upload_processing(result) -> None:
                 type=["xlsx"],
                 key="product_descriptions_upload",
             )
+            descriptions_raw = None
+            selected_code_column = None
+            selected_description_column = None
+            if descriptions_file is not None:
+                try:
+                    descriptions_raw = read_excel_upload(descriptions_file)
+                    available_columns = descriptions_raw.columns.tolist()
+                    if not available_columns:
+                        raise ValueError("Excel nemá žiadne stĺpce.")
+                    guessed_code_column = _resolve_column(descriptions_raw, *PRODUCT_CODE_COLUMNS)
+                    guessed_description_column = _resolve_column(descriptions_raw, *PRODUCT_DESCRIPTION_COLUMNS)
+                    mapping_columns = st.columns(2)
+                    with mapping_columns[0]:
+                        selected_code_column = st.selectbox(
+                            "Stĺpec s kódom produktu",
+                            options=available_columns,
+                            index=available_columns.index(guessed_code_column) if guessed_code_column in available_columns else 0,
+                        )
+                    with mapping_columns[1]:
+                        default_description_index = (
+                            available_columns.index(guessed_description_column)
+                            if guessed_description_column in available_columns
+                            else min(1, len(available_columns) - 1)
+                        )
+                        selected_description_column = st.selectbox(
+                            "Stĺpec s popisom produktu",
+                            options=available_columns,
+                            index=default_description_index,
+                        )
+                    if guessed_code_column is None or guessed_description_column is None:
+                        st.info("Názvy stĺpcov neboli rozpoznané automaticky. Skontrolujte výber vyššie.")
+                except Exception as exc:
+                    st.error(f"Excel sa nepodarilo načítať: {exc}")
             if st.button("Pridať popisy do aktuálnej dávky", type="primary"):
                 if descriptions_file is None:
                     st.warning("Najprv vyberte Excel s popismi produktov.")
+                elif descriptions_raw is None:
+                    st.warning("Najprv opravte problém s načítaním Excelu.")
                 else:
                     try:
-                        descriptions_raw = read_excel_upload(descriptions_file)
-                        import_stats = enrich_current_batch_with_descriptions(result, descriptions_raw)
+                        import_stats = enrich_current_batch_with_descriptions(
+                            result,
+                            descriptions_raw,
+                            code_column=selected_code_column,
+                            description_column=selected_description_column,
+                        )
                         batch_id = st.session_state.get("current_batch_id")
                         if batch_id is None:
                             raise ValueError("Aktuálna dátová dávka nemá batch_id.")
