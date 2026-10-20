@@ -493,13 +493,16 @@ def _review_has_saved_work(review: dict | None) -> bool:
     )
 
 
+def _review_is_completed(review: dict | None) -> bool:
+    """A case is completed only after execution was explicitly confirmed."""
+    if not review:
+        return False
+    return review.get("change_execution_status") == "Zmena vykonaná"
+
+
 def select_completed_decisions(reviewed_cases: pd.DataFrame, role: str, current_user: str) -> pd.DataFrame:
     """Return every completed decision for admins and only the current user's for reviewers."""
-    completed_mask = (
-        reviewed_cases["change_execution_status"].astype(str).eq("Zmena vykonaná")
-        | reviewed_cases["review_status"].astype(str).eq("Zmena vykonaná")
-        | reviewed_cases["status"].astype(str).eq("Zmena vykonaná")
-    )
+    completed_mask = reviewed_cases["change_execution_status"].astype(str).eq("Zmena vykonaná")
     completed_cases = reviewed_cases.loc[completed_mask].copy()
     if role == "admin":
         return completed_cases
@@ -1781,10 +1784,10 @@ def render_decision_review(result) -> None:
     if minimum_report_count and "report_count" in filtered.columns:
         filtered = filtered[filtered["report_count"] >= minimum_report_count]
 
-    saved_case_ids = {
+    completed_case_ids = {
         str(case_id)
         for case_id, review in st.session_state.review_data.items()
-        if _review_has_saved_work(review)
+        if _review_is_completed(review)
     }
     case_view = st.radio(
         "Case list",
@@ -1793,7 +1796,7 @@ def render_decision_review(result) -> None:
         label_visibility="collapsed",
     )
     if case_view == "Cases":
-        filtered = filtered[~filtered["case_id"].astype(str).isin(saved_case_ids)]
+        filtered = filtered[~filtered["case_id"].astype(str).isin(completed_case_ids)]
         locked_by_others = {
             case_id
             for case_id, lock in active_locks.items()
@@ -1802,7 +1805,7 @@ def render_decision_review(result) -> None:
         filtered = filtered[~filtered["case_id"].astype(str).isin(locked_by_others)]
         list_title = "Cases"
     else:
-        filtered = filtered[filtered["case_id"].astype(str).isin(saved_case_ids)]
+        filtered = filtered[filtered["case_id"].astype(str).isin(completed_case_ids)]
         list_title = "Cases solved"
 
     st.subheader(list_title)
