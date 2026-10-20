@@ -1959,23 +1959,32 @@ def render_data_exports(result, role: str) -> None:
     reviewed_cases = build_reviewed_cases(result)
     current_user = _current_user_identifier()
 
-    if role == "admin":
-        saved_mask = (
-            reviewed_cases["review_saved_at"].astype(str).ne("")
-            | reviewed_cases["change_executed_at"].astype(str).ne("")
-            | reviewed_cases["validator_note"].astype(str).ne("")
-        )
-        executed_mask = reviewed_cases["change_execution_status"].astype(str).eq("Zmena vykonaná")
-        metric_cols = st.columns(3)
-        metric_cols[0].metric("Všetky prípady", len(reviewed_cases))
-        metric_cols[1].metric("Uložené rozhodnutia", int(saved_mask.sum()))
-        metric_cols[2].metric("Vykonané zmeny", int(executed_mask.sum()))
+    completed_mask = (
+        reviewed_cases["change_execution_status"].astype(str).eq("Zmena vykonaná")
+        | reviewed_cases["review_status"].astype(str).eq("Zmena vykonaná")
+        | reviewed_cases["status"].astype(str).eq("Zmena vykonaná")
+    )
+    user_mask = (
+        reviewed_cases["review_saved_by"].astype(str).eq(current_user)
+        | reviewed_cases["change_executed_by"].astype(str).eq(current_user)
+    )
+    user_cases = reviewed_cases.loc[completed_mask & user_mask].copy()
+
+    st.caption(f"Dokončené rozhodnutia používateľa {current_user}: {len(user_cases)}")
+    if user_cases.empty:
+        st.info("Zatiaľ nemáte žiadne dokončené rozhodnutia.")
+    else:
         st.download_button(
-            "Stiahnuť všetky rozhodnutia (Excel)",
-            data=reviewed_cases_bytes(reviewed_cases),
-            file_name="all_decisions.xlsx",
+            "Stiahnuť moje dokončené rozhodnutia",
+            data=reviewed_cases_bytes(user_cases),
+            file_name="my_completed_decisions.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
+        st.dataframe(user_cases, use_container_width=True, hide_index=True)
+
+    if role == "admin":
+        st.divider()
+        st.markdown("**Administrácia**")
         reviewer_token = os.environ.get("INSTRUCTION_VALIDATOR_REVIEWER_TOKEN", "")
         if reviewer_token:
             reviewer_url = f"{st.context.url}?reviewer_token={quote_plus(reviewer_token)}"
@@ -1994,37 +2003,12 @@ def render_data_exports(result, role: str) -> None:
                 }
         prepared_backup = st.session_state.get("admin_database_backup")
         if prepared_backup:
-            st.download_button(
-                "Stiahnuť databázovú zálohu",
+            st.download_button(                "Stiahnuť databázovú zálohu",
                 data=prepared_backup["data"],
                 file_name=prepared_backup["name"],
                 mime="application/json" if prepared_backup["name"].endswith(".json") else "application/vnd.sqlite3",
             )
         st.caption(f"Aktívne úložisko: {storage_location_label()}")
-        st.dataframe(reviewed_cases, use_container_width=True, hide_index=True)
-        return
-
-    completed_mask = (
-        reviewed_cases["change_execution_status"].astype(str).eq("Zmena vykonaná")
-        | reviewed_cases["review_status"].astype(str).eq("Zmena vykonaná")
-        | reviewed_cases["status"].astype(str).eq("Zmena vykonaná")
-    )
-    user_mask = (
-        reviewed_cases["review_saved_by"].astype(str).eq(current_user)
-        | reviewed_cases["change_executed_by"].astype(str).eq(current_user)
-    )
-    reviewer_cases = reviewed_cases.loc[completed_mask & user_mask].copy()
-    st.caption(f"Rozhodnutia používateľa {current_user}: {len(reviewer_cases)}")
-    if reviewer_cases.empty:
-        st.info("Zatiaľ nemáte žiadne dokončené rozhodnutia.")
-        return
-    st.download_button(
-        "Stiahnuť moje dokončené rozhodnutia",
-        data=reviewed_cases_bytes(reviewer_cases),
-        file_name="my_completed_decisions.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-    st.dataframe(reviewer_cases, use_container_width=True, hide_index=True)
 
 
 def main() -> None:
