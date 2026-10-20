@@ -7,7 +7,7 @@ import sqlite3
 import base64
 import gzip
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import StringIO
 from pathlib import Path
 from urllib.error import HTTPError
@@ -357,6 +357,215 @@ def save_review(batch_id: int | None, case_id: str, review: dict) -> None:
             """,
             (batch_id, str(case_id), values["payload_json"], updated_at),
         )
+
+
+CASE_LOCK_KEY = "_case_lock"
+CASE_LOCK_MINUTES = 20
+
+
+def _parse_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _active_lock(review: dict, now: datetime) -> dict | None:
+    lock = review.get(CASE_LOCK_KEY)
+    if not isinstance(lock, dict):
+        return None
+    expires_at = _parse_timestamp(lock.get("expires_at"))
+    if expires_at is None or expires_at <= now:
+        return None
+    return lock
+
+
+def load_case_locks(batch_id: int | None, now: datetime | None = None) -> dict[str, dict]:
+    """Return active locks keyed by case_id."""
+    if batch_id is None:
+        return {}
+    now = now or datetime.now().astimezone()
+    reviews = load_reviews(batch_id)
+    locks: dict[str, dict] = {}
+    for case_id, review in reviews.items():
+        lock = _active_lock(review, now)
+        if lock is not None:
+            locks[str(case_id)] = lock
+    return locks
+
+
+def claim_case(
+    batch_id: int | None,
+    case_id: str,
+    owner: str,
+    *,
+    lock_minutes: int = CASE_LOCK_MINUTES,
+) -> dict:
+    """Atomically reserve a case for one user and return the current lock state."""
+    if batch_id is None:
+        return {"acquired": False, "owner": "", "expires_at": "", "review": {}}
+    initialize_storage()
+    case_id = str(case_id)
+    owner = str(owner).strip()
+    now = datetime.now().astimezone()
+    expires_at = now + timedelta(minutes=max(int(lock_minutes), 1))
+    lock = {
+        "owner": owner,
+        "acquired_at": now.isoformat(),
+        "expires_at": expires_at.isoformat(),
+    }
+
+    if uses_persistent_cloud_storage():
+        for _ in range(3):
+            rows = _supabase_request(
+                "GET",
+                "reviews",
+                query={
+                    "select": "payload_json,updated_at",
+                    "batch_id": f"eq.{batch_id}",
+                    "case_id": f"eq.{case_id}",
+                    "limit": "1",
+                },
+            )
+            if not rows:
+                review = {CASE_LOCK_KEY: lock}
+                inserted = _supabase_request(
+                    "POST",
+                    "reviews",
+                    query={"on_conflict": "batch_id,case_id", "select": "payload_json"},
+                    payload={
+                        "batch_id": batch_id,
+                        "case_id": case_id,
+                        "payload_json": json.dumps(review, ensure_ascii=False),
+                        "updated_at": now.isoformat(),
+                    },
+                    prefer="resolution=ignore-duplicates,return=representation",
+                )
+                if inserted:
+                    return {"acquired": True, "owner": owner, "expires_at": lock["expires_at"], "review": review}
+                continue
+
+            current = rows[0]
+            review = json.loads(current["payload_json"])
+            active = _active_lock(review, now)
+            if active is not None and str(active.get("owner", "")) != owner:
+                return {
+                    "acquired": False,
+                    "owner": str(active.get("owner", "")),
+                    "expires_at": str(active.get("expires_at", "")),
+                    "review": review,
+                }
+            review[CASE_LOCK_KEY] = lock
+            updated = _supabase_request(
+                "PATCH",
+                "reviews",
+                query={
+                    "batch_id": f"eq.{batch_id}",
+                    "case_id": f"eq.{case_id}",
+                    "updated_at": f"eq.{current['updated_at']}",
+                    "select": "payload_json",
+                },
+                payload={"payload_json": json.dumps(review, ensure_ascii=False), "updated_at": now.isoformat()},
+                prefer="return=representation",
+            )
+            if updated:
+                return {"acquired": True, "owner": owner, "expires_at": lock["expires_at"], "review": review}
+        return {"acquired": False, "owner": "iný používateľ", "expires_at": "", "review": {}}
+
+    with _connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            "SELECT payload_json FROM reviews WHERE batch_id = ? AND case_id = ?",
+            (batch_id, case_id),
+        ).fetchone()
+        review = json.loads(row["payload_json"]) if row is not None else {}
+        active = _active_lock(review, now)
+        if active is not None and str(active.get("owner", "")) != owner:
+            return {
+                "acquired": False,
+                "owner": str(active.get("owner", "")),
+                "expires_at": str(active.get("expires_at", "")),
+                "review": review,
+            }
+        review[CASE_LOCK_KEY] = lock
+        connection.execute(
+            """
+            INSERT INTO reviews (batch_id, case_id, payload_json, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(batch_id, case_id) DO UPDATE SET
+                payload_json = excluded.payload_json,
+                updated_at = excluded.updated_at
+            """,
+            (batch_id, case_id, json.dumps(review, ensure_ascii=False), now.isoformat()),
+        )
+    return {"acquired": True, "owner": owner, "expires_at": lock["expires_at"], "review": review}
+
+
+def release_case(batch_id: int | None, case_id: str | None, owner: str) -> bool:
+    """Release a case only when it is currently owned by the requesting user."""
+    if batch_id is None or not case_id:
+        return False
+    initialize_storage()
+    case_id = str(case_id)
+    owner = str(owner).strip()
+    now = datetime.now().astimezone()
+
+    if uses_persistent_cloud_storage():
+        for _ in range(3):
+            rows = _supabase_request(
+                "GET",
+                "reviews",
+                query={
+                    "select": "payload_json,updated_at",
+                    "batch_id": f"eq.{batch_id}",
+                    "case_id": f"eq.{case_id}",
+                    "limit": "1",
+                },
+            )
+            if not rows:
+                return False
+            current = rows[0]
+            review = json.loads(current["payload_json"])
+            lock = review.get(CASE_LOCK_KEY)
+            if not isinstance(lock, dict) or str(lock.get("owner", "")) != owner:
+                return False
+            review.pop(CASE_LOCK_KEY, None)
+            updated = _supabase_request(
+                "PATCH",
+                "reviews",
+                query={
+                    "batch_id": f"eq.{batch_id}",
+                    "case_id": f"eq.{case_id}",
+                    "updated_at": f"eq.{current['updated_at']}",
+                    "select": "case_id",
+                },
+                payload={"payload_json": json.dumps(review, ensure_ascii=False), "updated_at": now.isoformat()},
+                prefer="return=representation",
+            )
+            if updated:
+                return True
+        return False
+
+    with _connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            "SELECT payload_json FROM reviews WHERE batch_id = ? AND case_id = ?",
+            (batch_id, case_id),
+        ).fetchone()
+        if row is None:
+            return False
+        review = json.loads(row["payload_json"])
+        lock = review.get(CASE_LOCK_KEY)
+        if not isinstance(lock, dict) or str(lock.get("owner", "")) != owner:
+            return False
+        review.pop(CASE_LOCK_KEY, None)
+        connection.execute(
+            "UPDATE reviews SET payload_json = ?, updated_at = ? WHERE batch_id = ? AND case_id = ?",
+            (json.dumps(review, ensure_ascii=False), now.isoformat(), batch_id, case_id),
+        )
+    return True
 
 
 def backup_database(retention: int = 20) -> Path | None:

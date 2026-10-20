@@ -18,7 +18,7 @@ import pandas as pd
 import streamlit as st
 
 from processing import clean_code_value, export_workbook, run_pipeline
-from storage import backup_database, initialize_storage, latest_batch_key, load_latest_pipeline_result, load_reviews, save_pipeline_result, save_review, storage_location_label, update_batch_tables, uses_persistent_cloud_storage
+from storage import backup_database, claim_case, initialize_storage, latest_batch_key, load_case_locks, load_latest_pipeline_result, load_reviews, release_case, save_pipeline_result, save_review, storage_location_label, update_batch_tables, uses_persistent_cloud_storage
 
 
 st.set_page_config(
@@ -200,6 +200,7 @@ def init_session_state() -> None:
     st.session_state.setdefault("final_action_widget", FINAL_ACTION_OPTIONS[0])
     st.session_state.setdefault("validator_note_widget", "")
     st.session_state.setdefault("session_saved_case_ids", set())
+    st.session_state.setdefault("active_case_lock_id", None)
 
 
 def render_access_login() -> str | None:
@@ -212,6 +213,11 @@ def render_access_login() -> str | None:
         role_label = "Admin" if role == "admin" else "Kvalitár"
         st.sidebar.success(f"{role_label}: {identity}")
         if st.sidebar.button("Odhlásiť"):
+            release_case(
+                st.session_state.get("current_batch_id"),
+                st.session_state.get("active_case_lock_id"),
+                _current_user_identifier(),
+            )
             st.session_state.access_role = None
             st.session_state.access_identity = ""
             st.session_state.reviewer_link_authorized = False
@@ -1569,6 +1575,8 @@ def mark_change_as_executed(case_id: str) -> None:
     st.session_state[_review_widget_key(case_id, "status")] = updated["review_status"]
     save_review(st.session_state.get("current_batch_id"), case_id, updated)
     _mark_case_saved_for_session(case_id)
+    release_case(st.session_state.get("current_batch_id"), case_id, _current_user_identifier())
+    st.session_state.active_case_lock_id = None
     if not uses_persistent_cloud_storage():
         backup_database()
 
@@ -1680,6 +1688,9 @@ def render_case_detail(case_id: str, case_row: pd.Series) -> None:
 
 def render_decision_review(result) -> None:
     review_df = apply_review_statuses(result.cases_enriched)
+    batch_id = st.session_state.get("current_batch_id")
+    current_user = _current_user_identifier()
+    active_locks = load_case_locks(batch_id)
 
     def _options_for(column: str) -> list[str]:
         if column not in review_df.columns:
@@ -1763,6 +1774,12 @@ def render_decision_review(result) -> None:
     )
     if case_view == "Cases":
         filtered = filtered[~filtered["case_id"].astype(str).isin(saved_case_ids)]
+        locked_by_others = {
+            case_id
+            for case_id, lock in active_locks.items()
+            if str(lock.get("owner", "")) != current_user
+        }
+        filtered = filtered[~filtered["case_id"].astype(str).isin(locked_by_others)]
         list_title = "Cases"
     else:
         filtered = filtered[filtered["case_id"].astype(str).isin(saved_case_ids)]
@@ -1816,12 +1833,26 @@ def render_decision_review(result) -> None:
         f"Zobrazených {len(visible_cases)} z {len(filtered)} filtrovaných cases. "
         f"Zostáva {remaining_count}."
     )
-    st.dataframe(visible_cases.loc[:, display_columns], use_container_width=True, hide_index=True)
+    st.caption("Kliknutím na riadok vyberiete case a otvoríte jeho detail.")
+    table_event = st.dataframe(
+        visible_cases.loc[:, display_columns],
+        use_container_width=True,
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        key=f"decision_case_table_{filter_signature[:12]}",
+    )
 
     case_options = visible_cases["case_id"].dropna().astype(str).tolist() if "case_id" in visible_cases.columns else []
     if not case_options:
         st.info("No cases match the current filters.")
         return
+
+    selected_rows = list(getattr(getattr(table_event, "selection", None), "rows", []) or [])
+    if selected_rows:
+        selected_position = int(selected_rows[0])
+        if 0 <= selected_position < len(visible_cases):
+            st.session_state["decision_case_selector"] = str(visible_cases.iloc[selected_position]["case_id"])
 
     if st.session_state.get("decision_case_selector") not in case_options:
         st.session_state["decision_case_selector"] = case_options[0]
@@ -1830,6 +1861,18 @@ def render_decision_review(result) -> None:
         options=case_options,
         key="decision_case_selector",
     )
+    previous_case_id = st.session_state.get("active_case_lock_id")
+    lock_result = claim_case(batch_id, selected_case_id, current_user)
+    if not lock_result["acquired"]:
+        st.warning(f"Case {selected_case_id} práve spracováva {lock_result['owner']}. Vyberte iný case.")
+        return
+    if previous_case_id and previous_case_id != selected_case_id:
+        release_case(batch_id, previous_case_id, current_user)
+    st.session_state.active_case_lock_id = selected_case_id
+    persisted_review = lock_result.get("review") or {}
+    if persisted_review:
+        st.session_state.review_data[selected_case_id] = persisted_review
+    st.caption(f"🔒 Case je rezervovaný pre: {current_user}")
     selected_row = review_df.loc[review_df["case_id"].astype(str) == selected_case_id].iloc[0]
     ensure_review_defaults(selected_case_id, selected_row)
     render_case_detail(selected_case_id, selected_row)
