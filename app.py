@@ -493,6 +493,23 @@ def _review_has_saved_work(review: dict | None) -> bool:
     )
 
 
+def select_completed_decisions(reviewed_cases: pd.DataFrame, role: str, current_user: str) -> pd.DataFrame:
+    """Return every completed decision for admins and only the current user's for reviewers."""
+    completed_mask = (
+        reviewed_cases["change_execution_status"].astype(str).eq("Zmena vykonaná")
+        | reviewed_cases["review_status"].astype(str).eq("Zmena vykonaná")
+        | reviewed_cases["status"].astype(str).eq("Zmena vykonaná")
+    )
+    completed_cases = reviewed_cases.loc[completed_mask].copy()
+    if role == "admin":
+        return completed_cases
+    user_mask = (
+        completed_cases["review_saved_by"].astype(str).eq(current_user)
+        | completed_cases["change_executed_by"].astype(str).eq(current_user)
+    )
+    return completed_cases.loc[user_mask].copy()
+
+
 def _normalize_review_entry(entry: dict | None, row: pd.Series | None = None) -> dict:
     recommended_action = safe_text_value(row, "recommended_action", default="") if row is not None else ""
     default_status = "Nový"
@@ -2002,28 +2019,23 @@ def render_data_exports(result, role: str) -> None:
     reviewed_cases = build_reviewed_cases(result)
     current_user = _current_user_identifier()
 
-    completed_mask = (
-        reviewed_cases["change_execution_status"].astype(str).eq("Zmena vykonaná")
-        | reviewed_cases["review_status"].astype(str).eq("Zmena vykonaná")
-        | reviewed_cases["status"].astype(str).eq("Zmena vykonaná")
-    )
-    user_mask = (
-        reviewed_cases["review_saved_by"].astype(str).eq(current_user)
-        | reviewed_cases["change_executed_by"].astype(str).eq(current_user)
-    )
-    user_cases = reviewed_cases.loc[completed_mask & user_mask].copy()
+    export_cases = select_completed_decisions(reviewed_cases, role, current_user)
+    is_admin = role == "admin"
+    scope_label = "Všetky dokončené rozhodnutia" if is_admin else f"Dokončené rozhodnutia používateľa {current_user}"
+    download_label = "Stiahnuť všetky dokončené rozhodnutia" if is_admin else "Stiahnuť moje dokončené rozhodnutia"
+    file_name = "all_completed_decisions.xlsx" if is_admin else "my_completed_decisions.xlsx"
 
-    st.caption(f"Dokončené rozhodnutia používateľa {current_user}: {len(user_cases)}")
-    if user_cases.empty:
-        st.info("Zatiaľ nemáte žiadne dokončené rozhodnutia.")
+    st.caption(f"{scope_label}: {len(export_cases)}")
+    if export_cases.empty:
+        st.info("Zatiaľ nie sú žiadne dokončené rozhodnutia." if is_admin else "Zatiaľ nemáte žiadne dokončené rozhodnutia.")
     else:
         st.download_button(
-            "Stiahnuť moje dokončené rozhodnutia",
-            data=reviewed_cases_bytes(user_cases),
-            file_name="my_completed_decisions.xlsx",
+            download_label,
+            data=reviewed_cases_bytes(export_cases),
+            file_name=file_name,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
-        st.dataframe(user_cases, use_container_width=True, hide_index=True)
+        st.dataframe(export_cases, use_container_width=True, hide_index=True)
 
     if role == "admin":
         st.divider()
