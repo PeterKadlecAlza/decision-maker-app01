@@ -615,7 +615,10 @@ def _image_column_name(row: pd.Series) -> str | None:
 
 
 def _display_placeholder_image() -> None:
-    st.info("Fotografia produktu nie je k dispozícii.")
+    st.warning(
+        "📷 Produktu chýba skladová fotografia. "
+        "Odfoťte produkt čítačkou s fotoaparátom a fotografiu uložte v skladovom systéme."
+    )
 
 
 def render_product_image(row: pd.Series) -> None:
