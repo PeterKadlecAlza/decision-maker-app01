@@ -2072,6 +2072,14 @@ def main() -> None:
         section_labels.insert(0, "Admin upload")
     selected_section = st.radio("Section", section_labels, horizontal=True, label_visibility="collapsed")
 
+    if selected_section != "Decision Review" and st.session_state.get("active_case_lock_id"):
+        release_case(
+            st.session_state.get("current_batch_id"),
+            st.session_state.get("active_case_lock_id"),
+            _current_user_identifier(),
+        )
+        st.session_state.active_case_lock_id = None
+
     if selected_section == "Admin upload":
         render_upload_processing(result)
     elif selected_section == "Dashboard":
